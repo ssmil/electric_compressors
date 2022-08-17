@@ -1,0 +1,1066 @@
+---
+title: "Interstate Compressor Station Driver Fuel Type"
+author: "Sean Smillie"
+date: "2022-08-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(readxl)
+library(gridExtra)
+library(cowplot)
+library(ggfortify)
+library(MASS)
+library(quantreg)
+select <- dplyr::select
+
+paper <- theme_set(theme_bw() + theme(text = element_text(size = 8)))
+# presentation <- theme_set(theme_bw() + theme(text = element_text(size = 16)))
+```
+
+```{r load_data, include=FALSE}
+# Load compressor station data
+setwd("C:/Users/ssmil/OneDrive/Work/Academics/PhD/Projects - Gas-elec reliability/Data/ABB Velocity Suite")
+dat <- read_xlsx("Gas compressor stations all years.xlsx")
+
+```
+
+# Data exploration
+
+Summarise number of pipelines and stations
+
+```{r}
+dat %>% select(`Gas Pipeline Name`) %>% distinct() %>% summarise(n=n())
+dat %>% select(c("Compressor Station ID")) %>% distinct() %>% summarise(n=n())
+```
+
+Electric vs gas consumption over time
+```{r}
+# Efficiency ranges
+eff <- tibble(elec_min=0.7,
+              elec_max=0.9,
+              gas_min=0.1,
+              gas_max=0.4)
+
+dat %>% 
+  group_by(Year) %>% 
+  summarise(Electricity = sum(`Electricity for Compressor Station kWh`)*0.85, # 85% efficiency
+            Gas = sum(`Gas for Compressor Fuel Dth`)*293.071*0.4, # Convert to kWh, 40% efficiency
+            Total_energy = Electricity + Gas
+            ) %>% 
+  pivot_longer(cols = c("Gas","Electricity"), names_to = "Energy_type", values_to = "Energy") %>% 
+  ggplot() +
+  geom_area(aes(x = Year, y = Energy, fill = factor(Energy_type, levels = c("Gas","Electricity")))) +
+  scale_fill_manual(name = "Energy type", values = c("#31688E","#35B879")) 
+
+dat %>% 
+  group_by(Year) %>% 
+  summarise(Electricity = sum(`Electricity for Compressor Station kWh`)*0.85, # 85% efficiency
+            Gas = sum(`Gas for Compressor Fuel Dth`)*293.071*0.4, # Convert to kWh, 40% efficiency
+            Total_energy = Electricity + Gas
+            ) %>% 
+  mutate(Gas_perc = Gas / Total_energy,
+         Elec_perc = Electricity / Total_energy) %>% 
+  pivot_longer(cols = c("Gas_perc","Elec_perc"), names_to = "Energy_type", values_to = "Energy") %>%
+  ggplot() +
+  geom_area(aes(x = Year, y = Energy, fill = factor(Energy_type, levels = c("Gas_perc","Elec_perc")))) +
+  scale_x_continuous(limits = c(2008,2020)) +
+  scale_fill_manual(name = "Energy type", values = c("#31688E","#35B879"))
+
+dat %>% 
+  group_by(Year) %>% 
+  summarise(Electricity = sum(`Electricity for Compressor Station kWh`)*0.85, # 85% efficiency
+            Gas = sum(`Gas for Compressor Fuel Dth`)*293.071*0.3, # Convert to kWh, 30% efficiency
+            Total_energy = Electricity + Gas
+            ) %>% 
+  mutate(Gas_perc = Gas / Total_energy,
+         Elec_perc = Electricity / Total_energy) %>% 
+  ggplot() +
+  geom_area(aes(x = Year, y = Elec_perc)) +
+  scale_x_continuous(limits = c(2008,2020), breaks = seq(2008,2020,2)) +
+  scale_fill_viridis_d(name = "Energy type") +
+  scale_y_continuous(name = "Percentage of compressor power \nfrom electricity", 
+                     labels = scales::percent_format())
+```
+
+Change in units year-over-year
+
+```{r}
+dat %>% 
+  ungroup() %>% group_by(Year) %>% 
+  summarize(`Number of Units` = sum(`Number of Units`)) %>% 
+  mutate(previous_year = lag(`Number of Units`),
+         change_from_last = `Number of Units` - previous_year)
+```
+
+Total units, installed power, average unit power, unit power distribution over time
+
+```{r}
+dat %>% 
+  group_by(Year) %>% 
+  summarise(`Number of Units` = sum(`Number of Units`)) %>% 
+  ggplot() +
+  geom_line(aes(x = Year, y = `Number of Units`)) 
+  
+dat %>% 
+  group_by(Year) %>% 
+  summarise(`Certificated Horsepower` = sum(`Certificated Horsepower`)) %>% 
+  ggplot() +
+  geom_line(aes(x = Year, y = `Certificated Horsepower`)) 
+
+dat %>% 
+  group_by(Year) %>% 
+  summarise(Power_pu = sum(`Certificated Horsepower`)/sum(`Number of Units`)) %>% 
+  ggplot() +
+  geom_line(aes(x = Year, y = Power_pu)) 
+
+dat %>% 
+  filter(Year %in% c(2000,2005,2010,2015,2020)) %>% 
+  mutate(Power_pu = `Certificated Horsepower` / `Number of Units`,
+         Year = as.factor(Year)) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = Year, y = Power_pu)) 
+
+
+dat %>% 
+  filter(Year %in% c(2000,2005,2010,2015,2020)) %>% 
+  mutate(Power_pu = `Certificated Horsepower` / `Number of Units`,
+         Year = as.factor(Year)) %>% 
+  ggplot() + 
+  geom_density(aes(x = Power_pu, color = Year), adjust = 1.5) +
+  scale_x_continuous(limits = c(0,50000))
+
+```
+
+# Data cleaning
+
+Compressor station data identifiers to identify stations & sub-stations
+
+```{r group_stations, echo=TRUE}
+
+station_ID <- c("Holding Company Name",
+                "Gas Pipeline Name",
+                "Compressor Station Name",
+                "Flow Point County / State",
+                "Flow Point Number",
+                "Compressor Station ID",
+                "Compressor Station Type")
+```
+
+
+```{r group_stations, include=FALSE}
+# Find duplicated station names
+stations <- dat %>% 
+  select(station_ID) %>% 
+  distinct() 
+
+stations_dup <- stations %>% 
+  group_by(`Flow Point Number`,`Compressor Station ID`,`Compressor Station Type`) %>% 
+  summarise(n=n()) %>% 
+  filter(n>1) %>% 
+  select(-n) %>% 
+  left_join(.,dat)
+
+stations %>% select(`Gas Pipeline Name`) %>% distinct() %>% summarise(n=n())
+
+```
+
+
+```{r}
+# Convert to SI units, calculate normalized variables for plotting
+
+dat.stn <- dat %>% 
+  mutate(`Gas for Compressor Fuel GJ` = `Gas for Compressor Fuel Dth` * 1.05506, # Convert Dth to GJ
+         `Installed Capacity kW` = `Certificated Horsepower` * 0.7456999, # Convert HP to kW
+         `Op hrs per unit` = `Total Hours in Operation during Year` / `Number of Units`,
+         `Gas GJ_kW ratio` = `Gas for Compressor Fuel GJ` / `Installed Capacity kW`, # GJ/kW
+         `Gas kWh_kW ratio` = `Gas GJ_kW ratio` / 0.0036,
+         `Elec kW ratio` = `Electricity for Compressor Station kWh` / `Installed Capacity kW`  # kWh/kW
+  ) %>% 
+  group_by(across(all_of(station_ID))) %>% 
+  nest() %>% 
+  ungroup()
+
+station_num <- tibble(compID = length(unique(dat$`Compressor Station ID`)),
+                             stationID = nrow(dat.stn))
+
+dat.stn %>% select(`Gas Pipeline Name`) %>% distinct() %>% summarise(n=n())
+```
+
+If grouping the data into stations using the variable "Compressor Station ID" alone, there are `station_num$compID` unique stations in the dataset, if grouping by all seven variables identified above there are `station_num$stationID` identified stations. Examining the difference, grouping by the additional variables identifies more granular reporting at a sub-station level, which could be useful for distinguishing stations that have both gas and electric drives if these are reported separately.
+
+# Initial station sorting 
+
+We plot electricity use against operating hours for sixteen randomly selected stations. We have normalized Operating Hours by dividing by the number of units to get hours less than 8760 for each year, and have normalized the electricity consumption by dividing by the installed horsepower at the station. We see that most stations do not report any electricity consumption. In this sample, 2 report electricity consumption that increases with operating hours, and several stations have small but non-zero electricity consumption that does not appear to be correlated to operating hours. No electricity consumption is reported in years <2007, likely indicating a new reporting requirement starting that year.
+```{r echo=FALSE}
+set.seed(20) # Toggle to look at same stations over time
+
+dat.stn %>% 
+  slice_sample(n=25) %>% 
+  unnest(data) %>% 
+  ggplot() +
+  geom_point(aes(x = `Op hrs per unit`, y = `Elec kW ratio`, color = Year)) +
+  lims(x=c(0,9784)) +
+  # scale_colour_continuous(breaks = c(2008,2020)) +
+  facet_wrap(vars(`Compressor Station Name`), ncol = 5)
+
+```
+
+Sort of stations by all gas, all electric, and combination use. Our first screen is therefore whether each stations reports only electricity use, only gas use, or both gas and electric use, reported by station and by percentage below. The "other" category includes stations where no energy consumption data is reported, or in a few cases, because the consumption values are negative. 
+
+```{r echo=FALSE}
+# Label stations by whether the use only electricity, only gas, or both
+
+fuel_sep_fun <- function(df){
+  
+  df2 <- tibble(
+    energy.type = case_when(
+      sum(df$`Gas for Compressor Fuel GJ`) >  0 & sum(df$`Electricity for Compressor Station kWh`) == 0 ~ "gas",
+      sum(df$`Gas for Compressor Fuel GJ`) == 0 & sum(df$`Electricity for Compressor Station kWh`) >  0 ~ "electric",
+      sum(df$`Gas for Compressor Fuel GJ`) >  0 & sum(df$`Electricity for Compressor Station kWh`) >  0 ~ "both",
+      TRUE ~ "other"
+      )
+  )
+  return(df2)
+}
+
+dat.stn <- dat.stn %>% 
+  mutate(energy.type = map(data,fuel_sep_fun)) %>% 
+  unnest(energy.type) %>% 
+  ungroup()
+
+table(dat.stn$energy.type)
+table(dat.stn$energy.type) / nrow(dat.stn)
+```
+
+The distribution of stations reporting different fuel sources by capacity is shown in the next two graphs. "Other" stations tend to have lower installed capacities, and there are few large stations solely powered by electricity.
+
+```{r echo=FALSE}
+other <- dat.stn %>% filter(energy.type == "other") %>% unnest(data)
+
+dat.stn %>% 
+  unnest(data) %>% 
+  filter(Year == 2020) %>% 
+  ggplot() +
+  geom_violin(aes(y = `Installed Capacity kW`/1e3, x = energy.type)) +
+  labs(y = "Station Capacity (MW)") 
+  # lims(y=c(0,3))
+
+dat.stn %>% 
+  unnest(data) %>% 
+  filter(Year == 2020) %>% 
+  ggplot() +
+  geom_histogram(aes(x = `Installed Capacity kW`/1e3, fill = energy.type)) +
+  labs(x = "Station Capacity (MW)") 
+  # lims(x=c(0,3))
+
+dat.stn %>% filter(energy.type == "electric")
+```
+
+The stations identified as consuming only electricity are shown below, as a random sample of 25 stations and combined annual datapoints from all identified electric stations. Only data from 2008 and later are shown.
+
+These graphs identify a relatively similar slope, which is indicative of the efficiency of the electric drivers. Shallower slopes may be a factor of the normalized y-axis, where dividing by the total station capacity may lead to shallower slopes when the some units have low operating hours. Some data issues are also apparent: values on the x- and y-axes likely indicate missing values. Missing electric values are more common in earlier years. Operating hours above 8760 (in leap years, 8784) indicate that operating hours or the number of units have been misreported in some cases.
+
+```{r}
+
+set.seed(42) # Toggle to look at same stations over time
+
+dat.stn %>% 
+  filter(energy.type == "electric") %>% 
+  slice_sample(n=25) %>% # Select sample of 25 stations
+  unnest(data) %>% 
+  filter(Year>=2007) %>% # Only display data >2007, when electricity use first being reported
+  ggplot() +
+  geom_point(aes(x = `Op hrs per unit`, y = `Elec kW ratio`, color = Year)) +
+  geom_vline(xintercept = 8784) +
+  scale_color_continuous(breaks = c(2007,2020)) +
+  facet_wrap(vars(`Compressor Station Name`), ncol = 5) +
+  labs(title = "Electricity use vs utilization by electric compressor station",
+       x = "Operating hours per installed unit",
+       y = "Electricity use by installed compression capacity (kWh/kW)") 
+
+# All plotted together
+dat.stn %>% 
+  filter(energy.type == "electric") %>% 
+  unnest(data) %>% 
+  filter(Year>=2007) %>% 
+  ggplot() +
+  geom_point(aes(x = `Op hrs per unit`, y = `Elec kW ratio`, color = Year))  +
+  scale_color_continuous(breaks = c(2007,2020)) +
+  geom_vline(xintercept = 8784) +
+  labs(title = "Electricity use vs utilization, all electric compressor stations",
+       x = "Operating hours per installed unit",
+       y = "Electricity use by installed capacity (kWh/kW)") 
+
+```
+
+Similar graphs are shown for gas stations. Considerable data cleaning may be required on the gas-driven dataset if it were to be used for analysis, which it does not necessarily need to be. When constraining the range of the data to 8760, a strong correlation between gas use and operating hours emerges.
+
+```{r echo=FALSE}
+
+set.seed(42) # Toggle to look at same stations over time
+
+dat.stn %>% 
+  filter(energy.type == "gas") %>% 
+  slice_sample(n=25) %>% # Select sample of 25 stations
+  unnest(data) %>% 
+  filter(Year>=2007) %>% # Only display data >2007, when electricity use first being reported
+  ggplot() +
+  geom_point(aes(x = `Op hrs per unit`, y = `Gas GJ_kW ratio`, color = Year)) +
+  scale_color_continuous(breaks = c(2007,2020)) +
+  facet_wrap(vars(`Compressor Station Name`), ncol = 5) +
+  geom_vline(xintercept = 8784) +
+  labs(title = "Gas use vs utilization, all gas compressor stations",
+       x = "Operating hours per installed unit",
+       y = "Gas use by installed capacity (GJ/kW)") 
+
+# All plotted together
+dat.stn %>% 
+  filter(energy.type == "gas") %>% 
+  unnest(data) %>% 
+  filter(Year>=2007) %>% # Only display data >2007, when electricity use first being reported
+  ggplot() +
+  geom_point(aes(x = `Op hrs per unit`, y = `Gas GJ_kW ratio`, color = Year)) +
+  scale_color_continuous(breaks = c(2007,2020)) +
+  geom_vline(xintercept = 8784) +
+  labs(title = "Gas use vs utilization, all gas compressor stations",
+       x = "Operating hours per installed unit",
+       y = "Gas use by installed capacity (GJ/kW)") 
+
+dat.stn %>% 
+  filter(energy.type == "gas") %>% 
+  unnest(data) %>% 
+  filter(Year>=2007) %>% # Only display data >2007, when electricity use first being reported
+  ggplot() +
+  geom_point(aes(x = `Op hrs per unit`, y = `Gas GJ_kW ratio`, color = Year)) +
+  scale_color_continuous(breaks = c(2007,2020)) +
+  coord_cartesian(xlim = c(0,8784), ylim = c(0,100)) +
+  geom_vline(xintercept = 8784) +
+  labs(title = "Gas use vs utilization, all gas compressor stations",
+       x = "Operating hours per installed unit",
+       y = "Gas use by installed capacity (GJ/kW)") 
+
+```
+
+In the series of six plots that follow, we show results from stations that report both gas and electric energy use. First, we show gas and electric use vs operating hours for individual stations. Between the gas and electric plots, the stations are identical. We observe that most stations either seem to fall into electrically driven or gas driven, because energy use for one fuel rises with operating hours but not for the other fuel. For some stations, energy use of both fuels increases with operating hours likely indicating multiple unit stations, where some are driven by each fuel type. For example, the Ceredo station shown below shows a positive relationship for both gas and electric.
+```{r echo=FALSE}
+set.seed(1) # Toggle to look at same stations over time
+
+# Individual stations, electric use
+dat.stn %>% 
+  filter(energy.type == "both") %>% 
+  slice_sample(n=25) %>% # Select sample of 25 stations
+  unnest(data) %>% 
+  filter(Year>=2007) %>% # Only display data >2007, when electricity use first being reported
+  ggplot() +
+  geom_point(aes(x = `Op hrs per unit`, y = `Elec kW ratio`, color = Year)) +
+  geom_vline(xintercept = 8784) +
+  scale_color_continuous(breaks = c(2007,2020)) +
+  coord_cartesian(xlim = c(0,8784), ylim = c(0,7500)) +
+  facet_wrap(vars(`Compressor Station Name`), ncol = 5) +
+  labs(title = "Electricity use vs utilization by mixed fuel compressor station",
+       x = "Operating hours per installed unit",
+       y = "Electricity use by installed compression capacity (kWh/kW)") 
+
+set.seed(1) # Toggle to look at same stations over time
+
+# Individual stations, gas use
+dat.stn %>% 
+  filter(energy.type == "both") %>% 
+  slice_sample(n=25) %>% # Select sample of 25 stations
+  unnest(data) %>% 
+  filter(Year>=2007) %>% # Only display data >2007, when electricity use first being reported
+  ggplot() +
+  geom_point(aes(x = `Op hrs per unit`, y = `Gas GJ_kW ratio`, color = Year)) +
+  scale_color_continuous(breaks = c(2007,2020)) +
+  coord_cartesian(xlim = c(0,8784), ylim = c(0,100)) +
+  facet_wrap(vars(`Compressor Station Name`), ncol = 5) +
+  geom_vline(xintercept = 8784) +
+  labs(title = "Gas use vs utilization, all mixed fuel compressor stations",
+       x = "Operating hours per installed unit",
+       y = "Gas use by installed capacity (GJ/kW)")
+```
+
+The next four plots show results for all stations plotted together. There are two plots each for electric and gas, and for each fuel there is a plot with unbounded axis, showing outliers indicating data quality issues, as well as bounded figures to better show the general trend.
+
+```{r echo=FALSE}
+# All plotted together, electric
+dat.stn %>% 
+  filter(energy.type == "both") %>% 
+  unnest(data) %>% 
+  filter(Year>=2007) %>% # Only display data >2007, when electricity use first being reported
+  ggplot() +
+  geom_point(aes(x = `Op hrs per unit`, y = `Elec kW ratio`, color = Year)) +
+  scale_color_continuous(breaks = c(2007,2020)) +
+  geom_vline(xintercept = 8784) +
+  labs(title = "Electricity use vs utilization, all mixed fuel compressor stations",
+       x = "Operating hours per installed unit",
+       y = "Electricity use by installed capacity (kWh/kW)") 
+
+# All plotted together, electric, narrowed bounds
+dat.stn %>% 
+  filter(energy.type == "both") %>% 
+  unnest(data) %>% 
+  filter(Year>=2007) %>% # Only display data >2007, when electricity use first being reported
+  ggplot() +
+  geom_point(aes(x = `Op hrs per unit`, y = `Elec kW ratio`, color = Year)) +
+  scale_color_continuous(breaks = c(2007,2020)) +
+  geom_vline(xintercept = 8784) +
+  coord_cartesian(xlim = c(0,8784), ylim = c(0,7500)) +
+  labs(title = "Electricity use vs utilization, all mixed fuel compressor stations",
+       x = "Operating hours per installed unit",
+       y = "Electricity use by installed capacity (kWh/kW)") 
+
+# All plotted together, gas
+dat.stn %>% 
+  filter(energy.type == "both") %>% 
+  unnest(data) %>% 
+  filter(Year>=2007) %>% # Only display data >2007, when electricity use first being reported
+  ggplot() +
+  geom_point(aes(x = `Op hrs per unit`, y = `Gas GJ_kW ratio`, color = Year)) +
+  # geom_abline(slope = 0.0036/(eff$gas_min), intercept = 0, linetype="solid") +
+  # geom_abline(aes(slope = 0.0036/(eff$gas_max)), intercept = 0, linetype="dashed") +
+  scale_color_continuous(breaks = c(2007,2020)) +
+  geom_vline(xintercept = 8784) +
+  labs(title = "Gas use vs utilization, all mixed fuel compressor stations",
+       x = "Operating hours per installed unit",
+       y = "Gas use by installed capacity (GJ/kW)") 
+
+# All plotted together, gas, narrowed bounds
+dat.stn %>% 
+  filter(energy.type == "both") %>% 
+  unnest(data) %>% 
+  filter(Year>=2007) %>% # Only display data >2007, when electricity use first being reported
+  ggplot() +
+  geom_point(aes(x = `Op hrs per unit`, y = `Gas GJ_kW ratio`, color = Year)) +
+  geom_abline(slope = 0.0036/(eff$gas_min), intercept = 0, linetype="solid") +
+  geom_abline(aes(slope = 0.0036/(eff$gas_max)), intercept = 0, linetype="dashed") +
+  scale_color_continuous(breaks = c(2007,2020)) +
+  coord_cartesian(xlim = c(0,8784), ylim = c(0,100)) +
+  geom_vline(xintercept = 8784) +
+  labs(title = "Gas use vs utilization, all mixed fuel compressor stations",
+       x = "Operating hours per installed unit",
+       y = "Gas use by installed capacity (GJ/kW)") 
+
+```
+
+# Estimating driver type for stations reported both gas and electric use
+
+Next, we estimate the primary driver type for stations reporting both gas and electric use, using the reported energy consumption for both fuels and operating hours. 
+
+Filter for only stations that report both gas and electric use.
+
+```{r echo=FALSE}
+station_ID[length(station_ID)+1] <- "energy.type"
+
+dat.stn.dual <- dat.stn %>% 
+  filter(energy.type == "both") %>% 
+  unnest(data) %>% 
+  filter(Year >= 2007) %>% 
+  group_by(across(all_of(station_ID))) %>% 
+  nest() 
+
+```
+
+Create plotting function to visualize both gas and electric use vs operating hours for multiple stations at a time. This plots can be used to determine the driver fuel source.
+
+```{r echo=FALSE}
+plot_stations <- function(df,eff){
+  
+  ggpubr::ggarrange(
+    ggplot(data = df,
+           mapping = aes(x = `Total Hours in Operation during Year`, 
+                         y = `Electricity for Compressor Station kWh`,
+                         color = Year)) +
+      geom_point() +
+      # geom_smooth(method="lm", color = "blue", se = FALSE) +
+      # geom_smooth(method="rlm", color = "green", se = FALSE) +
+      # geom_smooth(method="rq", color = "red", se = FALSE) +
+      geom_abline(aes(linetype = type,
+                      slope = m, 
+                      intercept = 0),
+                  data = df %>% 
+                    filter(Year==2020) %>% 
+                    mutate(m_max = `Installed Capacity kW`/eff$elec_min,
+                           m_avg = `Installed Capacity kW`/(`Number of Units`*eff$elec_max),
+                           # m_1000 = 1000/eff$elec_max,
+                           m_500 = 500/eff$elec_max
+                    ) %>% 
+                    pivot_longer(cols = c("m_avg","m_500","m_max"#,"m_1000"
+                    ), names_to = "type", values_to = "m")
+      ) +
+      scale_color_continuous(breaks = c(2007,2020)) +
+      scale_linetype(name = 'Benchmark unit power',
+                     labels = c('500 kW Driver','Average unit power','Full station power'),
+                     # guide = guide_legend(reverse = TRUE)
+      ) +
+      expand_limits(x=0,y=0) +
+      labs(#title = "Electricity use vs utilization",
+           x = "Operating hours",
+           y = "Electricity use (kWh)")  +
+      # theme(legend.position = "none") +
+      facet_wrap(vars(`Compressor Station Name`),nrow=1,scales = "free") +
+      theme(axis.title.x=element_blank(),
+            axis.text.x=element_blank(),
+            axis.ticks.x=element_blank(),
+            legend.key.size = unit(0.8,"lines"))
+    ,
+    NULL
+    ,
+    ggplot(data = df,
+           mapping = aes(x = `Total Hours in Operation during Year`, 
+                         y = `Gas for Compressor Fuel GJ`,
+                         color = Year)) +
+      geom_point() +
+      # geom_smooth(method="lm", color = "blue", se = FALSE) +
+      # geom_smooth(method="rlm", color = "green", se = FALSE) +
+      # geom_smooth(method="rq", color = "red", se = FALSE) +
+      geom_abline(aes(linetype = type,
+                      slope = m, 
+                      intercept = 0),
+                  data = df %>% 
+                    filter(Year==2020) %>% 
+                    mutate(m_max = 0.0036*`Installed Capacity kW`/eff$gas_min,
+                           m_avg = 0.0036*`Installed Capacity kW`/(`Number of Units`*eff$gas_max),
+                           # m_1000 = 0.0036*1000/eff$gas_max,
+                           m_500 = 0.0036*500/eff$gas_max
+                    ) %>% 
+                    pivot_longer(cols = c("m_avg","m_500","m_max"#,"m_1000"
+                    ), names_to = "type", values_to = "m")
+      ) +
+      scale_color_continuous(breaks = c(2007,2020)) +
+      scale_linetype(name = 'Benchmark unit power',
+                     labels = c('500 kW driver','Average unit power','Full station power'),
+                     # guide = guide_legend(reverse = TRUE)
+      ) +
+      scale_x_continuous(labels = scales::label_comma()) +
+      expand_limits(x=0,y=0) +
+      labs(#title = "Gas use vs utilization",
+           x = "Operating hours",
+           y = "Gas use (GJ)")  +
+      # theme(legend.position = "none") +
+      facet_wrap(vars(`Compressor Station Name`),nrow=1,scales = "free")
+    ,
+    nrow=3,ncol=1,
+    labels=NULL,
+    hjust = 0.5,
+    align="hv",
+    heights = c(1,-0.15,1),
+    legend = "bottom",
+    common.legend = TRUE
+  )
+}
+```
+
+Save a station dataset to record driver type classifications based on the graph examination.
+
+```{r}
+# Write results to csv for manual viewing
+dat.stn.dual <- dat.stn.dual %>% 
+  ungroup() %>% 
+  arrange(`Compressor Station ID`,`Flow Point Number`)
+
+# dat.stn.dual %>% 
+#   select(-data) %>% 
+#   write_csv(.,"Dual Fuel Stations_simple.csv")
+```
+
+The graph below shows results for randomly selected compressor stations. 
+
+```{r echo=FALSE}
+# set.seed(1)
+# df <- dat.stn.dual %>% ungroup() %>% slice_sample(n=5)
+
+df <- dat.stn %>% 
+               ungroup() %>% 
+               filter(energy.type=="electric") %>% 
+               slice_sample(n=9) %>% 
+               unnest(data) %>%   
+               filter(Year>=2008)
+
+# df <- dat.stn %>% filter(energy.type=="gas") %>% ungroup() %>% slice_sample(n=6) %>% unnest(data) 
+
+df %>% plot_stations(.,eff)
+```
+
+Visually exam each station that reports both gas and electric use. Each station is assessed individually, and where needed, the station data is examined in tabular form to supplement the graphic analysis. Driver type confidence is assigned as high, medium, and low. Primary criteria assessed are whether points are within theoretical slope ranges and whether correlation to operating hours is high. 
+
+```{r}
+
+theme_set(paper)
+
+df <- dat.stn %>% 
+  # filter(energy.type == "both" & )
+  # filter(`Flow Point Number` %in% c(56933)) # == 53877)
+  filter(`Flow Point Number` %in% c(56933,54006,56002))
+  # filter(`Gas Pipeline Name` == "Florida Gas Transmission Co")
+  # filter(`Compressor Station Name` %in% c("Corning Compressor",
+  #                                         "Croghan",
+  #                                         "Beech Hill Compressor",
+  #                                         "Concord Compressor",
+  #                                         "Derby Compressor",
+  #                                         "NFGS Independence Compressor",
+  #                                         "Limestone High Pressure East (DEL)",
+  #                                         "Porterville",
+  #                                         "Tuscarora Compressor",
+  #                                         "Zoar Compressor")) %>% unnest()
+  
+# 56933 Electric High confidence
+# 54006 Gas high confidence
+# 56002 Mixed high confidence
+
+# Dataframe view
+# View(df)
+
+# Plot view
+df %>% 
+  # slice(1:3) %>%
+  unnest(data) %>% 
+  filter(Year >= 2008) %>%
+  plot_stations(.,eff)
+
+# ggsave("Stations sorting.tiff", width = 18, height = 11, units = "cm", dpi = 600)
+
+```
+
+After each station is visually inspected and driver type input into Excel file, load and recombine these datasets.
+
+```{r}
+
+dat.stn.manual <- read_xlsx("Dual Fuel Stations.xlsx")
+
+station_ID2 <- station_ID
+station_ID2[8] <- "Driver_type"
+
+dat.stn.sorted <- left_join(dat.stn,dat.stn.manual, by = station_ID) %>% 
+  mutate(Driver_type = case_when(energy.type == "gas" ~ "Gas",
+                                 energy.type == "electric" ~ "Electric",
+                                 energy.type == "other" ~ "Unclear",
+                                 energy.type == "both" ~ Manual_drive,
+                                 TRUE ~ "error")) %>% 
+  unnest(data) %>% 
+  group_by(across(all_of(station_ID2))) %>% 
+  filter(Year == max(Year))
+
+
+```
+
+Clean the dataset, removing variables that do not add value
+
+```{r}
+# dup <- dat.stn.sorted[dat.stn.sorted %>% select(station_ID2) %>% duplicated(),] %>% 
+#   select(all_of(station_ID2)) %>% 
+#   inner_join(dat.stn.sorted,., by = station_ID2)
+# Duplicates are sites that list various units separately in the matched year. This was considered in manual driver type designation, so can be combined.
+
+var_keep <- c(
+  "Holding Company Name",                   "Gas Pipeline Name",
+  "Compressor Station Name",                "Compressor Station Type",
+  "Driver_type",                            "Confidence",
+  "Compressor Station ID",                  
+
+  "Year",                                   "Installed Capacity kW",  
+  "Number of Units",                        "Total Hours in Operation during Year",
+  "Electricity for Compressor Station kWh", "Gas for Compressor Fuel GJ",             
+  # "Compressor Station Peak",                "Number of Units In Oper at Peak",        
+  
+  "Ownership Type",                         "Regulated / Non-regulated",              
+  "LNG Operator",                           "SNG Plant Operator",                    
+  "Gas Producer",                           "Gatherer",                              
+  "Storage Operator",
+  
+  "Flow Point Name",                        "Flow Point Number",
+  "Flow Point County / State",              "Flow Point County", 
+  "Flow Point State",                       "Flow Point County ID",                     
+  "Flow Point Code",                        "Flow Point DRNNO",     
+  
+  "Holding Company ID",                     "Holding Company Abbrev",      
+  "Gas Pipeline ID",                        "Entity Abbrev"                  
+)
+
+var_sum <- c(
+  "Installed Capacity kW",  
+  "Number of Units",                        "Total Hours in Operation during Year",
+  "Electricity for Compressor Station kWh", "Gas for Compressor Fuel GJ")
+
+# Find variables to keep not already in grouping variables
+
+dat.stn.sorted <- dat.stn.sorted %>% 
+  group_by(across(all_of(station_ID2))) %>% 
+  summarise(across(all_of(var_sum), sum),
+            across(all_of(var_keep[! (((var_keep %in% station_ID2) | var_keep %in% var_sum))]), first) )
+```
+
+Find duplicates and decommissioned stations/units
+
+```{r}
+# dat.stn.sorted %>%
+#   write_csv(.,"Sorted_Station_List_station_ID.csv")
+
+# Get duplicate values
+dup <- dat.stn.sorted %>% 
+  janitor::get_dupes(`Compressor Station ID`,`Flow Point Number`) %>% 
+  filter(Year != 2020 & Driver_type == "Gas")
+
+# Count stations/sub-stations by driver type
+table(dat.stn.sorted$Driver_type)
+
+# Count pipelines and stations
+dat.stn.sorted %>% ungroup() %>% select("Gas Pipeline Name") %>% distinct() %>% summarise(n=n())
+dat.stn.sorted %>% ungroup()  %>% select("Compressor Station ID") %>% distinct() %>% summarise(n=n())
+
+```
+
+Reload the cleaned dataset. Create summary statistics.
+
+```{r}
+dat.stn.sorted.cleaned <- read_csv("Sorted_Station_List_station_ID_dupcleaned.csv")
+dat.stn.sorted.cleaned$`Installed Capacity kW` <- as.numeric(dat.stn.sorted.cleaned$`Installed Capacity kW`)
+
+dup <- dat.stn.sorted.cleaned %>% 
+  janitor::get_dupes(`Compressor Station ID`,`Flow Point Number`)
+
+table(dat.stn.sorted.cleaned$Confidence,dat.stn.sorted.cleaned$Driver_type, useNA = "always")
+
+dat.stn.sorted.cleaned %>% 
+  group_by(Driver_type,Confidence) %>% 
+  summarize(Power = sum(`Installed Capacity kW`, na.rm = TRUE)) %>% 
+  pivot_wider(names_from = Driver_type, values_from = Power)
+
+dat.stn.sorted.cleaned %>% 
+  group_by(Driver_type,`Compressor Station Type`) %>% 
+  summarize(
+    # Number = n(), 
+    Power = sum(`Installed Capacity kW`, na.rm = TRUE)) %>% 
+  pivot_wider(names_from = Driver_type, values_from = Power)
+
+dat.stn.sorted.cleaned %>% ungroup() %>% select("Gas Pipeline Name") %>% distinct() %>% summarise(n=n())
+dat.stn.sorted.cleaned %>% ungroup()  %>% select("Compressor Station ID") %>% distinct() %>% summarise(n=n())
+
+```
+
+Load dataset containing station locations.
+
+```{r}
+gas_flow_points <- read_xlsx("C:/Users/ssmil/Documents/ArcGIS/Projects/Electric_Compressors/Natural_Gas_Flow_Points_TableToExcel.xlsx")
+
+```
+
+Join station locations to the compressor station data, check the number joined/unjoined.
+
+```{r}
+dat.stn.sorted_locations <- left_join(dat.stn.sorted.cleaned, gas_flow_points, 
+          by = c(#"Gas Pipeline Name" = "Gas_Pipeli", 
+                 "Flow Point Number" = "Flow_Point",
+                 "Compressor Station ID" = "Point_ID"))
+
+test2 <- dat.stn.sorted_locations %>% filter(Driver_type != "Gas" & is.na(OBJECTID) & `Installed Capacity kW` > 0)
+
+dat.stn.sorted_locations %>% ungroup() %>% select("Gas Pipeline Name") %>% distinct() %>% summarise(n=n())
+dat.stn.sorted_locations %>% ungroup()  %>% select("Compressor Station ID") %>% distinct() %>% summarise(n=n())
+
+# test2 %>% ungroup() %>% summarize(power = sum(`Installed Capacity kW`))
+
+# writexl::write_xlsx(dat.stn.sorted_locations, "Station drivers and locations.xlsx")
+
+```
+
+For those that were originally unlocated, find their locations from pipeline maps and satellite imagery. Import full list containing the newly located stations. Combine with list of California stations derived from Form 2 submissions to the CPUC. Create summary statistics.
+
+```{r}
+
+# Import latest station list, cleaned of duplicates and with additional stations located
+dat.stn.sorted.cleaned <- read_xlsx("Station drivers and locations_manualCleanLocate.xlsx")
+
+dat.stn.sorted.cleaned %>% 
+  select(`Gas Pipeline Name`,`Gas Pipeline ID`) %>% 
+  distinct() %>% 
+  anti_join(dat.stn.sorted, ., by = c("Gas Pipeline Name", "Gas Pipeline ID"))
+
+cal_comps <- read_xlsx("California Station drivers and locations.xlsx",na=c("","NA")) %>%
+  select(-energy.type)
+
+# Combine with California stations
+dat.stn.sorted.cleaned <-  bind_rows(dat.stn.sorted.cleaned,cal_comps)
+
+test <- dat.stn.sorted.cleaned %>% ungroup() %>% filter(!is.na(Latitude))
+# test <- cal_comps
+test %>% select("Gas Pipeline Name") %>% distinct() %>% summarise(n=n()) %>% as.numeric()
+test %>% select("Compressor Station ID") %>% distinct() %>% summarise(n=n())
+test %>% summarise(n=n())
+
+test %>% 
+  group_by(Driver_type,Confidence) %>% 
+  summarize(Power = sum(`Installed Capacity kW`, na.rm = TRUE))
+
+test %>% 
+  group_by(Driver_type,`Compressor Station Type`) %>% 
+  summarize(
+    # Number = n(), 
+    Power = sum(`Installed Capacity kW`, na.rm = TRUE)
+    ) %>% 
+  pivot_wider(names_from = Driver_type, values_from = Power)
+
+# writexl::write_xlsx(dat.stn.sorted.cleaned, "Station drivers and locations_USandCalifornia.xlsx")
+
+```
+
+# Supplemental results
+
+Create estimates of electric dependence by state, export for visualization. 
+
+```{r}
+
+state.na <- dat.stn.sorted.cleaned %>% 
+  filter(is.na(`Flow Point State`)) 
+
+state_summaries <- dat.stn.sorted.cleaned %>% 
+  group_by(`Flow Point State`,Driver_type) %>% 
+  summarize(gas_consumption_GJ   = sum(`Gas for Compressor Fuel GJ`, na.rm = TRUE),
+            elec_consumption_kWh = sum(`Electricity for Compressor Station kWh`, na.rm = TRUE),
+            station_capacity_kW  = sum(`Installed Capacity kW`, na.rm = TRUE)
+            ) %>% 
+  arrange(`Flow Point State`) %>% 
+  mutate(gas_consumption_GJ = case_when(Driver_type == "Electric" ~ 0,
+                                        TRUE ~ gas_consumption_GJ),
+         elec_consumption_kWh = case_when(Driver_type == "Gas" ~ 0,
+                                          TRUE ~ elec_consumption_kWh)) %>% 
+  ungroup() 
+
+# Ratio of electric consumption, not used in paper 
+state_summaries_consumption <- state_summaries %>% 
+  group_by(`Flow Point State`) %>% 
+  summarize(gas_consumption_GJ_driver   = sum(gas_consumption_GJ, na.rm = TRUE),
+            elec_consumption_kWh_driver = sum(elec_consumption_kWh, na.rm = TRUE),
+            total_station_capacity_kW  = sum(station_capacity_kW, na.rm = TRUE)
+            ) %>% 
+  mutate(elec_ratio_consumption = (elec_consumption_kWh_driver*0.8 / (elec_consumption_kWh_driver*0.8 + gas_consumption_GJ_driver/0.0036*0.25)) %>% round(.,digits=3)) 
+
+# Ratio of electric capacity, assuming Mixed and Unclear are 50% electric
+state_summaries_capacity <- state_summaries %>% 
+  group_by(`Flow Point State`) %>% 
+  mutate(elec_ratio_capacity = case_when(Driver_type == "Electric" ~ station_capacity_kW/sum(station_capacity_kW),
+                                         Driver_type == "Mixed" | Driver_type == "Unclear" ~ station_capacity_kW/sum(station_capacity_kW)/2,
+                                         Driver_type == "Gas" ~ 0)
+         ) %>% 
+  summarize(elec_ratio_capacity = sum(elec_ratio_capacity) %>% round(.,digits=3))
+
+# Summarize states values, add rows for Vermont and Delaware that don't have compressors in dataset.
+state_summaries_final <- left_join(
+  state_summaries_consumption,
+  state_summaries_capacity, 
+  by = "Flow Point State"
+  ) %>% 
+  add_row(`Flow Point State`="VT", gas_consumption_GJ_driver=0, elec_consumption_kWh_driver=0, total_station_capacity_kW=0, elec_ratio_consumption = as.numeric(NA), elec_ratio_capacity=as.numeric(NA)) %>% 
+    add_row(`Flow Point State`="DE", gas_consumption_GJ_driver=0, elec_consumption_kWh_driver=0, total_station_capacity_kW=0, elec_ratio_consumption = as.numeric(NA), elec_ratio_capacity=as.numeric(NA)) %>% 
+  filter(!is.na(`Flow Point State`) & `Flow Point State` != "VS")
+
+state_summaries %>% 
+  filter(!is.na(`Flow Point State`)) %>% 
+  group_by(Driver_type) %>% 
+  summarize(
+    # Number = n(), 
+    Power = sum(station_capacity_kW, na.rm = TRUE)
+    ) %>% 
+  pivot_wider(names_from = Driver_type, values_from = Power)
+
+rm(state.na,state_summaries,state_summaries_consumption,state_summaries_capacity)
+
+# writexl::write_xlsx(state_summaries_final,"State_elec_ratios_station_ID.xlsx")
+```
+
+Summarize results by station type, primarily to determine transmission vs storage electric vulnerability.
+
+```{r}
+
+table(dat.stn.sorted.cleaned$`Compressor Station Type`,dat.stn.sorted.cleaned$Driver_type)
+```
+
+Create estimates of electric dependence by pipeline, export for visualization. 
+
+```{r}
+# Create estimates of gas vs electric dependence by pipeline system
+pipeline_summaries <- dat.stn.sorted.cleaned %>% 
+  # filter(`Flow Point State` == "TX") %>% 
+  group_by(`Gas Pipeline ID`,Driver_type) %>% 
+  summarize(gas_consumption_GJ   = sum(`Gas for Compressor Fuel GJ`, na.rm = TRUE),
+            elec_consumption_kWh = sum(`Electricity for Compressor Station kWh`, na.rm = TRUE),
+            station_capacity_kW  = sum(`Installed Capacity kW`, na.rm = TRUE)
+            ) %>% 
+  arrange(`Gas Pipeline ID`) %>% 
+  mutate(gas_consumption_GJ = case_when(Driver_type == "Electric" ~ 0,
+                                        TRUE ~ gas_consumption_GJ),
+         elec_consumption_kWh = case_when(Driver_type == "Gas" ~ 0,
+                                          TRUE ~ elec_consumption_kWh)) %>% 
+  ungroup() 
+
+
+pipeline_summaries_consumption <- pipeline_summaries %>% 
+  group_by(`Gas Pipeline ID`) %>% 
+  summarize(gas_consumption_GJ_driver   = sum(gas_consumption_GJ, na.rm = TRUE),
+            elec_consumption_kWh_driver = sum(elec_consumption_kWh, na.rm = TRUE),
+            total_station_capacity_kW  = sum(station_capacity_kW, na.rm = TRUE)
+            ) %>% 
+  mutate(elec_ratio_consumption = (elec_consumption_kWh_driver*0.8 / (elec_consumption_kWh_driver*0.8 + gas_consumption_GJ_driver/0.0036*0.25)) %>% round(.,digits=3)) 
+
+
+pipeline_summaries_capacity <- pipeline_summaries %>% 
+  group_by(`Gas Pipeline ID`) %>% 
+  mutate(elec_ratio_capacity = case_when(Driver_type == "Electric" ~ station_capacity_kW/sum(station_capacity_kW),
+                                         Driver_type == "Mixed" | Driver_type == "Unclear" ~ station_capacity_kW/sum(station_capacity_kW)/2,
+                                         Driver_type == "Gas" ~ 0)
+         ) %>% 
+  summarize(elec_ratio_capacity = sum(elec_ratio_capacity) %>% round(.,digits=3))
+
+
+pipeline_summaries_final <- left_join(
+  pipeline_summaries_consumption,
+  pipeline_summaries_capacity, 
+  by = "Gas Pipeline ID"
+  ) %>% 
+  left_join(
+    .,
+    dat.stn.sorted.cleaned %>% select(`Gas Pipeline Name`,`Gas Pipeline ID`) %>% distinct(),
+    by = "Gas Pipeline ID"
+  )
+
+anti_join(pipeline_summaries_final %>% select(`Gas Pipeline Name`,`Gas Pipeline ID`),
+          dat.stn.sorted.cleaned %>% select(`Gas Pipeline Name`,`Gas Pipeline ID`))
+
+
+pipeline_summaries %>% 
+  filter(!is.na(`Gas Pipeline ID`)) %>% 
+  group_by(Driver_type) %>% 
+  summarize(
+    # Number = n(), 
+    Power = sum(station_capacity_kW, na.rm = TRUE)
+    ) %>% 
+  pivot_wider(names_from = Driver_type, values_from = Power)
+
+rm(pipeline_summaries_consumption,pipeline_summaries_capacity,pipeline_summaries)
+
+# No power information available for P&GE - mark as 21% electric dependent, based on 2 electric and 1 mixed station out of 12. (2.5/12=21%)
+pipeline_summaries_final$elec_ratio_capacity[pipeline_summaries_final$`Gas Pipeline ID`==1133] <- 0.21
+
+# writexl::write_xlsx(pipeline_summaries_final,"Pipeline_elec_ratios_station_ID.xlsx")
+
+```
+
+Create US-wide summary statistics
+
+```{r}
+US_summary <- dat.stn.sorted.cleaned %>% 
+  mutate(
+    `Gas for Compressor Fuel GJ` = 
+      case_when(Driver_type == "Electric" ~ 0,
+                TRUE ~ `Gas for Compressor Fuel GJ`),
+    `Electricity for Compressor Station kWh` = 
+      case_when(Driver_type == "Gas" ~ 0,
+                TRUE ~ `Electricity for Compressor Station kWh`)
+    ) %>% 
+  group_by(Driver_type) %>% 
+  summarise(`Gas for Compressor Fuel GJ`   = sum(`Gas for Compressor Fuel GJ`, na.rm = TRUE),
+            `Electricity for Compressor Station kWh` = sum(`Electricity for Compressor Station kWh`, na.rm = TRUE),
+            `Installed Capacity kW`  = sum(`Installed Capacity kW`, na.rm = TRUE))
+```
+
+Compare population density vs driver type. Load compressor and county population density data.
+
+```{r}
+
+setwd("C:/Users/ssmil/OneDrive/Work/Academics/PhD/Projects - Gas-elec reliability/Journal Submission/")
+station_list <- read_xlsx("Station list_FULL_2022-08-06.xlsx", sheet = 3)
+
+```
+
+Visualize population density vs driver type in various ways.
+
+```{r}
+
+station_list %>% 
+  filter(!is.na(POP_SQMI)) %>% 
+  group_by(`Driver type`) %>% 
+  summarise(pop_density_median = median(POP_SQMI, na.rm = T),
+            pop_density_average = mean(POP_SQMI, na.rm = T),
+            n = n())
+
+station_list %>% 
+  ggplot() +
+  # geom_point(aes(x = Driver_type, y = POP_SQMI), position = "jitter") +
+  geom_boxplot(aes(x = `Driver type`, fill = `Driver type`, y = POP_SQMI), alpha = 0.75) +
+  geom_violin(aes(x = `Driver type`, fill = `Driver type`, y = POP_SQMI), alpha = 0.25) +
+  scale_y_log10()
+
+station_list %>% 
+    filter(!is.na(POP_SQMI)) %>% 
+  # mutate(non_gas = case_when(Driver_type == "Gas" ~ "Gas",
+  #                            Driver_type != "Gas" ~ "Non-gas")) %>% 
+  filter(`Driver type` %in% c("Gas","Electric")) %>%
+  ggplot() +
+  geom_density(aes(color = `Driver type`, fill = `Driver type`, x = POP_SQMI),
+               alpha = 0.33) +
+  scale_x_log10(name = "County population density (Persons per sqmi)") +
+  scale_color_manual(name = "Energy type", values = c("#31688E","#35B879")) +
+  scale_fill_manual(name = "Energy type", values = c("#31688E","#35B879")) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) +
+  labs(y = "Probability density")
+
+
+station_list %>% 
+    filter(!is.na(POP_SQMI)) %>% 
+  mutate(non_gas = case_when(`Driver type` == "Gas" ~ "Gas",
+                             `Driver type` != "Gas" ~ "Non-gas")) %>% 
+  # filter(Driver_type %in% c("Gas","Electric")) %>% 
+  ggplot() +
+  geom_density(aes(fill = non_gas, x = POP_SQMI), alpha = 0.25) +
+  scale_x_log10()
+
+  # ggsave("Station population density.tiff", width = 12, height = 7, units = "cm", dpi = 1200)
+
+```
+
+Join Velocity Suite and HIFLD compressor station lists to publish HIFLD location data.
+
+```{r}
+
+# Load VS dataset with crosswalk to HIFLD compressor identifier.
+dat.stn.xwalk <- read_xlsx("C:/Users/ssmil/Documents/R/Gas-elec reliability/Station drivers and locations_USandCalifornia_xwalk.xlsx")
+
+dat.stn.xwalk <- dat.stn.xwalk %>% 
+  select(`Holding Company Name`,`Gas Pipeline Name`,`Compressor Station Name`,
+         Driver_type,Confidence,`Installed Capacity kW`,`HIFLD XWALK GCOMPID`) %>% 
+  mutate(Confidence = case_when(is.na(Confidence) & Driver_type == "Unclear" ~ "No fuel reported",
+                                is.na(Confidence) & Driver_type %in% c("Electric","Gas") ~ "Single fuel reported",
+                                TRUE ~ Confidence))
+
+# Load HIFLD compressor data
+dat.stn.HIFLD <- read_xlsx("C:/Users/ssmil/Documents/ArcGIS/HIFLD/Natural_Gas_Compressor_Stations.xlsx")
+
+dat.stn.HIFLD <- dat.stn.HIFLD %>% 
+  select(GCOMPID,NAME,OPERATOR,COUNTY,COUNTYFIPS,STATE,LATITUDE,LONGITUDE)
+
+dat.stn.xwalk <- dat.stn.xwalk %>% 
+  left_join(.,dat.stn.HIFLD, by = c("HIFLD XWALK GCOMPID" = "GCOMPID"))
+
+dup.xwalk <- dat.stn.xwalk %>% 
+  janitor::get_dupes(`HIFLD XWALK GCOMPID`)
+
+# Summarise the amount of compressors matched in HIFLD data
+dat.stn.xwalk %>% 
+  group_by(Driver_type) %>% 
+  summarise(located_n = sum(!is.na(`HIFLD XWALK GCOMPID`))/n(),
+            located_power = 
+              sum(if_else(!is.na(`HIFLD XWALK GCOMPID`),1,0)*`Installed Capacity kW`,na.rm=T)/
+              sum(`Installed Capacity kW`,na.rm=T)
+            )
+
+dat.stn.xwalk <- dat.stn.xwalk %>% 
+  filter(Driver_type != "Gas") %>% 
+  # select(-`Installed Capacity kW`,-NAME,-OPERATOR) %>%
+  arrange(`Holding Company Name`,`Gas Pipeline Name`,`Compressor Station Name`)
+
+# writexl::write_xlsx(dat.stn.xwalk,"Compressor station HIFLD crosswalk.xlsx")
+```
