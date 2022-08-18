@@ -1,0 +1,296 @@
+---
+title: "FGT_contingencies"
+author: "Sean Smillie"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+
+# presentation <- paper <- theme_set(theme_bw() + theme(text = element_text(size = 16)))
+paper <- theme_set(theme_bw() + theme(text = element_text(size = 8)))
+
+```
+
+# Set parameters 
+
+```{r}
+
+# Set heat rates for simple and combined cycles gas generators, from 2020 US-wide averages
+heat_rate <- tibble(simple = 11069, combined = 7604)
+
+```
+
+# Steady state pipeline profiles
+
+```{r}
+
+results_SSprofiles <- readxl::read_xlsx ("FGT_Steady_State_Profiles_pressure declines.xlsx", sheet = 1) 
+
+```
+
+```{r}
+
+results_SSprofiles %>%
+  mutate(`Reduction from base (Simple cycle MW)` =  (`Flow rate (Dth/d)` - 2650000)  / heat_rate$simple*1000/24,
+         `Reduction from base (Combined cycle MW)` = (`Flow rate (Dth/d)` - 2650000) / heat_rate$combined*1000/24,
+         `Flow rate (Dth/d)` = factor(`Flow rate (Dth/d)`)) %>% 
+  filter(Condition == "No N-1" & Parameters == "Mid" & Outage %in% c("None","Stn13") &
+           `Flow rate (Dth/d)` %in% c(2650000,2362500,2387500)) %>% 
+  
+  ggplot() +
+  geom_line(aes(x = `Length (miles)`, y = `Pressure (psig)`, 
+                color = `Flow rate (Dth/d)`),
+            size = 1.5, alpha = 0.4) +
+  lims(x = c(0,290), y = c(170,980)) +
+  # scale_color_manual(values = c("#B2B2B2","#31688E","#8D0016","#35B879","#440154"), name = "Flow rate") +
+  guides(alpha = "none", linetype = "none")
+
+# ggsave("FGT contingency steady-state flow range.tiff", width = 9, height = 5, units = "cm", dpi = 1200)
+# ggsave("FGT contingency steady-state flow range.tiff", width = 16, height = 9, units = "cm", dpi = 1200)
+```
+
+```{r}
+results_SSprofiles %>%
+  filter(
+    (Outage %in% c("None","Stn13")) &
+    Condition == "No N-1", Parameters == "Mid"
+    ) %>%
+  filter(`Flow rate (Dth/d)` %in% c(2650000,2387500,2362500) ) %>%
+  # select(Outage,Condition,Parameters,`Flow rate (Dth/d)`,`Profile pass`) %>% distinct()
+  ggplot() +
+  geom_line(aes(x = `Length (miles)`, y = `Pressure (psig)`, 
+                color = factor(`Flow rate (Dth/d)`),
+                linetype = factor(`Profile pass`), 
+                alpha = factor(`Flow rate (Dth/d)`)),  
+            size = 1) +
+  lims(x = c(0,365), y = c(170,980)) +
+  scale_color_manual(values = c("#31688E","#8D0016","#B2B2B2","#35B879","#440154"),
+  name = "Flow rate") +
+  scale_alpha_manual(values = c(0.75,0.75,0.5)) +
+  scale_linetype_manual(values = c("F1","longdash","twodash")) +
+  guides(alpha = "none", linetype = "none", color = "none") +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank()) 
+
+# ggsave("FGT contingency steady-state.tiff", width = 9, height = 4, units = "cm", dpi = 1200)
+
+```
+
+# Transient analysis
+
+```{r}
+
+# Read transient results for each contingency and bind together
+results_transients <- bind_rows(
+  readxl::read_xls("Trends/FGT_Ext_300_96_2_75_85_58_115_N1_outStn11.xls",         sheet = 1) %>% mutate(`Reliability Criteria` = "N-1", Outage = "Station 11 electric units"),
+  readxl::read_xls("Trends/FGT_Ext_300_96_2_75_85_58_115_N1_outStn13.xls",         sheet = 1) %>% mutate(`Reliability Criteria` = "N-1", Outage = "Station 13 electric units"),
+  readxl::read_xls("Trends/FGT_Ext_300_96_2_75_85_58_115_N1_outStn11and13.xls",    sheet = 1) %>% mutate(`Reliability Criteria` = "N-1", Outage = "Station 11 & 13 electric units"),
+  readxl::read_xls("Trends/FGT_Ext_300_96_2_75_85_58_115_N1_outStn11and12.xls",    sheet = 1) %>% mutate(`Reliability Criteria` = "N-1", Outage = "Station 11 & 12* electric units"),
+  readxl::read_xls("Trends/FGT_Ext_450_95_2_75_85_58_120_noN1_outStn11.xls",      sheet = 1) %>% mutate(`Reliability Criteria` = "No N-1", Outage = "Station 11 electric units"),
+  readxl::read_xls("Trends/FGT_Ext_450_95_2_75_85_58_120_noN1_outStn13.xls",      sheet = 1) %>% mutate(`Reliability Criteria` = "No N-1", Outage = "Station 13 electric units"),
+  readxl::read_xls("Trends/FGT_Ext_450_95_2_75_85_58_120_noN1_outStn11and13.xls", sheet = 1) %>% mutate(`Reliability Criteria` = "No N-1", Outage = "Station 11 & 13 electric units"),
+  readxl::read_xls("Trends/FGT_Ext_450_95_2_75_85_58_120_noN1_outStn11and12.xls", sheet = 1) %>% mutate(`Reliability Criteria` = "No N-1", Outage = "Station 11 & 12* electric units")
+ ) %>% 
+ select(38:39,1:37)
+
+# Adjust for Pipeline Studio output having contingency occur at time = 1
+results_transients <- 
+  results_transients %>% 
+  mutate(`Time (Hours)` = `Time (Hours)` - 1) %>% 
+  filter(`Time (Hours)` >= 0)
+
+# Create tidy data
+results_transients <- full_join(
+  results_transients %>%   
+    select(1:3,contains("Upstream Pressure")) %>% 
+    pivot_longer(cols = contains("Upstream Pressure"), 
+                 names_to = c("Point", "Extra"), names_prefix = "Station Bank ", names_sep = 5,
+                 values_to = "Upstream Pressure (psig)") %>% 
+    select(-Extra)
+  ,
+  results_transients %>%   
+    select(1:3,contains("Downstream Pressure")) %>% 
+    pivot_longer(cols = contains("Downstream Pressure"), 
+                 names_to = c("Point", "Extra"), names_prefix = "Station Bank ", names_sep = 5,
+                 values_to = "Downstream Pressure (psig)") %>% 
+    select(-Extra)
+  ,
+  by = c("Reliability Criteria", "Outage", "Time (Hours)", "Point")
+) %>% full_join(
+  .
+  ,
+  results_transients %>%   
+    select(1:3,contains("Energy Flow")) %>% 
+    pivot_longer(cols = contains("Energy Flow"), 
+                 names_to = c("Point", "Extra"), names_prefix = "Station Bank ", names_sep = 5,
+                 values_to = "Energy Flow (MMBTU/d)") %>% 
+    select(-Extra)
+  ,
+  by = c("Reliability Criteria", "Outage", "Time (Hours)", "Point")
+) %>% 
+  full_join(
+    .
+    ,
+    results_transients %>%   
+      select(1:3,contains("Power Required")) %>% 
+      pivot_longer(cols = contains("Power Required"), 
+                   names_to = c("Point", "Extra"), names_prefix = "Station Bank ", names_sep = 5,
+                   values_to = "Power Required (HP)") %>% 
+      select(-Extra)
+    ,
+    by = c("Reliability Criteria", "Outage", "Time (Hours)", "Point")
+  ) %>% 
+  full_join(
+    .
+    ,
+    results_transients %>%   
+      select(1:3,contains("Upstream Temperature")) %>% 
+      pivot_longer(cols = contains("Upstream Temperature"), 
+                   names_to = c("Point", "Extra"), names_prefix = "Station Bank ", names_sep = 5,
+                   values_to = "Upstream Temperature (F)") %>% 
+      select(-Extra)
+    ,
+    by = c("Reliability Criteria", "Outage", "Time (Hours)", "Point")
+  ) %>% 
+  full_join(
+    .
+    ,
+    results_transients %>%   
+      select(1:3,contains("Downstream Temperature")) %>% 
+      pivot_longer(cols = contains("Downstream Temperature"), 
+                   names_to = c("Point", "Extra"), names_prefix = "Station Bank ", names_sep = 5,
+                   values_to = "Downstream Temperature (F)") %>% 
+      select(-Extra)
+    ,
+    by = c("Reliability Criteria", "Outage", "Time (Hours)", "Point")
+  )
+
+```
+
+Graph results
+```{r}
+results_transients %>% 
+  filter(`Reliability Criteria` == "No N-1" & 
+         Outage == "Station 13 electric units") %>% 
+  pivot_longer(cols = contains("Pressure"), names_to = "Type", values_to = "Pressure (psig)") %>% 
+  ggplot() +
+  geom_line(aes(x = `Time (Hours)`, y = `Pressure (psig)`, color = Point, linetype = Type))
+
+```
+
+```{r}
+ggpubr::ggarrange(
+  
+  results_transients %>% 
+    filter(`Reliability Criteria` == "No N-1" & 
+             Outage == "Station 11 electric units" &
+             `Time (Hours)` < 50) %>%  
+    select(-contains("Temperature")) %>% 
+    ggplot() +
+    geom_line(aes(x = `Time (Hours)`, y = `Energy Flow (MMBTU/d)`)) +
+    facet_grid(cols = vars(Point), scales = "free_y") +
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_blank(),
+          axis.ticks.x=element_blank(),
+          legend.key.size = unit(0.8,"lines")) +
+    labs(y = "Energy Flow (Dth/d)") +
+    scale_y_continuous(limits=c(0,NA), labels = scales::label_comma(scale=1e-3, suffix = "k"))
+  ,
+  NULL
+  ,
+  results_transients %>% 
+    filter(`Reliability Criteria` == "N-1" & 
+             Outage == "Station 11 electric units" &
+             `Time (Hours)` < 50) %>%  
+    select(-contains("Temperature")) %>% 
+    ggplot() +
+    geom_line(aes(x = `Time (Hours)`, y = `Power Required (HP)`)) +
+    facet_grid(cols = vars(Point), scales = "free_y") +
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_blank(),
+          axis.ticks.x=element_blank(),
+          legend.key.size = unit(0.8,"lines")) +
+    labs(y = "Power Required (HP)") +
+    scale_y_continuous(limits=c(20000,100000), labels = scales::label_comma())
+  ,
+  NULL
+  ,
+  results_transients %>% 
+    filter(`Reliability Criteria` == "N-1" & 
+             Outage == "Station 11 electric units" &
+             `Time (Hours)` < 50) %>%  
+    select(-contains("Temperature")) %>% 
+    pivot_longer(cols = contains("Pressure"), names_to = "Pressure type", values_to = "Pressure (psig)") %>%
+    ggplot() +
+    geom_line(aes(x = `Time (Hours)`, y = `Pressure (psig)`, linetype = `Pressure type`)) +
+    facet_grid(cols = vars(Point), scales = "free_y") +
+    theme(legend.position = "bottom",
+          legend.key.size = unit(0.8,"lines")) +
+    labs(y = "Pressure (psig)")
+  ,
+  nrow=5,ncol=1,
+  labels=NULL,
+  hjust = 0.5,
+  align="hv",
+  heights = c(1,-0.18,1,-0.18,1),
+  legend = "bottom",
+  common.legend = TRUE
+)
+
+
+# ggsave("Detailed transient analysis.tiff", width = 18, height = 13, units = "cm", dpi = 1200)
+
+
+```
+
+```{r}
+results_transients %>% 
+  mutate(Outage = factor(str_replace(Outage," electric units",""),
+                         levels = c("Station 11", "Station 13", "Station 11 & 13", "Station 11 & 12*")),
+         `Reliability Criteria` = factor(`Reliability Criteria`, levels = c("No N-1","N-1"))) %>%  
+  group_by(`Reliability Criteria`,Outage,`Time (Hours)`) %>% 
+  summarise(`Min pressure (psig)` = min(min(`Upstream Pressure (psig)`),min(`Downstream Pressure (psig)`), na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  filter(`Min pressure (psig)` > 200) %>%
+  ggplot() + 
+  geom_line(aes(x = `Time (Hours)`, y = `Min pressure (psig)`, 
+                color = Outage, linetype = `Reliability Criteria`),
+            size = 0.75) +
+  # geom_hline(yintercept = c(587,275)) +
+  scale_y_continuous(limits = c(0,650), name = "Minimum system pressure (psig)") +
+  scale_x_continuous(name = "Time from outage (hours)") + # breaks = seq(13,34)
+  scale_color_viridis_d(name = "Electric outages") +
+  # scale_color_manual(values = c("#440154","#31688E","#35B879"), name = "Electric outages") +
+  scale_linetype(labels = c("Nonredundant","Redundant")) + #, values = c("solid","dotted")) +
+  theme(
+    panel.grid.minor = element_blank(),
+    # panel.grid.major = element_blank(),
+    # legend.box = "vertical",
+    # legend.box.just = "left",
+    # legend.box.margin = margin(0,0,0,0),
+    # legend.box.spacing = unit(0,"cm"), 
+    # legend.direction = "horizontal",
+    legend.justification = c(0,0),
+    legend.key.width = unit(0.5,"cm"),
+    legend.key.height = unit(0.25,"cm"),
+    # legend.key.size = unit(0.5,"cm"),
+    legend.margin = margin(0,0,0,0),
+    legend.position = c(0.03,0.035),
+    legend.spacing.y = unit(0.15,"cm")
+    # legend.spacing.x = unit(0,"cm"),
+    # legend.text = element_text(),
+    # legend.text.align = 0,
+    # legend.title = element_text(),
+  ) 
+  # guides(linetype = guide_legend(order=1), color = guide_legend(order=2))
+
+# ggsave("FGT contingency transient.tiff", width = 9, height = 6, units = "cm", dpi = 1200)
+
+
+```
+
+
+
